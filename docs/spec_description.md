@@ -1,132 +1,138 @@
-# Đặc tả Kỹ thuật: Dịch vụ Tải và Lưu trữ Sách (Book Downloader Service)
+# Technical Specification: Book Downloader Service
 
-## 1. Tổng quan dự án (Project Overview)
+## 1. Project Overview
 
-Dự án là một RESTful API Service được xây dựng bằng Node.js. Chức năng cốt lõi là nhận một hoặc nhiều đường dẫn (URL) của trang web đọc sách, trích xuất hình ảnh sách, tải về máy chủ, nén thành file ZIP và tự động tải lên Google Drive (hỗ trợ chỉ định thư mục lưu trữ cụ thể). Toàn bộ lịch sử, cấu trúc thư mục và đường dẫn lưu trữ được quản lý thông qua cơ sở dữ liệu SQLite.
+The Book Downloader Service is a RESTful API built on top of Node.js and NestJS. The core goal is to accept one or multiple web URLs of reading materials, scrape target page image links, sequentially download images to the local server, compress them into a ZIP archive, and upload the archive to Google Drive. The service uses SQLite for data persistence, storing metadata, folder mapping, download histories, and links to final uploaded archives.
 
-## 2. Ngôn ngữ & Thư viện (Tech Stack)
+## 2. Tech Stack
 
-- **Môi trường:** Node.js
-- **Framework Web:** Express.js
-- **Cơ sở dữ liệu:** SQLite3
-- **HTTP Client:** Axios (dùng để fetch HTML và tải file stream)
-- **Nén file:** Archiver
+- **Runtime & Framework:** Node.js, NestJS
+- **Database:** SQLite3 (via the direct `sqlite3` driver wrapped in a custom async provider)
+- **HTTP Client:** Axios (for HTML crawling and streaming file downloads)
+- **Archiving:** Archiver (ZIP compression, Level 9)
 - **Cloud Storage:** Google APIs (Google Drive API v3)
+- **API Documentation:** Swagger (@nestjs/swagger)
 
-## 3. Cấu trúc Cơ sở dữ liệu (Database Schema)
+## 3. Database Schema
 
-Sử dụng SQLite với 4 bảng chính có quan hệ mật thiết với nhau:
+Four SQLite tables are defined and initialized automatically at startup:
 
-### 3.1 Bảng `book` (Thông tin sách)
-
+### 3.1 Table `book`
+Stores general metadata for each scraped book:
 - `id` (INTEGER, PK, AUTOINCREMENT)
-- `title` (TEXT) - Trích xuất tự động từ phần cuối của URL.
-- `description` (TEXT)
-- `unsign_title` (TEXT)
-- `url` (TEXT) - Đường dẫn nguồn của sách.
-- `total_pages` (INTEGER) - Tổng số lượng ảnh thu thập được.
-- `created_at`, `updated_at` (DATETIME)
-- `deleted` (BOOLEAN) - Mặc định: 0.
+- `title` (TEXT, NOT NULL) - URL-extracted slug.
+- `description` (TEXT) - Custom description (e.g. source details).
+- `unsign_title` (TEXT) - Search key with Vietnamese accents stripped.
+- `url` (TEXT, UNIQUE, NOT NULL) - Original source URL.
+- `total_pages` (INTEGER, DEFAULT 0) - Scraped pages count.
+- `created_at` (DATETIME, DEFAULT CURRENT_TIMESTAMP)
+- `updated_at` (DATETIME, DEFAULT CURRENT_TIMESTAMP)
+- `deleted` (BOOLEAN, DEFAULT 0) - Soft-delete flag.
 
-### 3.2 Bảng `book_page` (Chi tiết từng trang sách)
-
-- `id` (INTEGER, PK, AUTOINCREMENT)
-- `book_id` (INTEGER, FK -> book.id)
-- `page_number` (INTEGER)
-- `image_url` (TEXT) - Đường dẫn ảnh gốc trên CDN.
-- `download_url` (TEXT) - Đường dẫn lưu file cục bộ (tạm thời trên server).
-- `created_at`, `updated_at` (DATETIME)
-- `deleted` (BOOLEAN)
-
-### 3.3 Bảng `gg_folder` (Quản lý thư mục Google Drive)
-
-- `id` (INTEGER, PK, AUTOINCREMENT)
-- `folder_id` (TEXT, UNIQUE) - ID gốc của thư mục trên Google Drive.
-- `folder_name` (TEXT) - Tên gợi nhớ (VD: `Folder_1a2b3c`).
-- `created_at`, `updated_at` (DATETIME)
-- `deleted` (BOOLEAN)
-
-### 3.4 Bảng `gg_drive` (Lưu trữ liên kết file ZIP)
-
+### 3.2 Table `book_page`
+Stores download details for individual pages:
 - `id` (INTEGER, PK, AUTOINCREMENT)
 - `book_id` (INTEGER, FK -> book.id)
-- `gg_folder_id` (INTEGER, FK -> gg_folder.id) - Khóa ngoại liên kết với thư mục chứa file.
-- `zip_file_url` (TEXT) - Web View Link để xem/tải file từ Google Drive.
-- `created_at`, `updated_at` (DATETIME)
-- `deleted` (BOOLEAN)
+- `page_number` (INTEGER, NOT NULL)
+- `image_url` (TEXT, NOT NULL) - Original page image URL.
+- `download_url` (TEXT) - Temp local download path.
+- `created_at` (DATETIME, DEFAULT CURRENT_TIMESTAMP)
+- `updated_at` (DATETIME, DEFAULT CURRENT_TIMESTAMP)
+- `deleted` (BOOLEAN, DEFAULT 0)
 
-## 4. Quy trình hoạt động (Business Logic)
+### 3.3 Table `gg_folder`
+Stores mapping for Google Drive directories:
+- `id` (INTEGER, PK, AUTOINCREMENT)
+- `folder_id` (TEXT, UNIQUE, NOT NULL) - Google Drive folder unique identifier.
+- `folder_name` (TEXT, NOT NULL) - Resolved Google Drive folder name.
+- `created_at` (DATETIME, DEFAULT CURRENT_TIMESTAMP)
+- `updated_at` (DATETIME, DEFAULT CURRENT_TIMESTAMP)
+- `deleted` (BOOLEAN, DEFAULT 0)
 
-Hệ thống xử lý hàng loạt (Bulk Processing) tuần tự qua các bước sau đối với từng URL nhận được:
+### 3.4 Table `gg_drive`
+Maps the final uploaded zip archive to the book and Google Drive folder:
+- `id` (INTEGER, PK, AUTOINCREMENT)
+- `book_id` (INTEGER, FK -> book.id)
+- `gg_folder_id` (INTEGER, FK -> gg_folder.id)
+- `zip_file_url` (TEXT, NOT NULL) - Drive view link.
+- `created_at` (DATETIME, DEFAULT CURRENT_TIMESTAMP)
+- `updated_at` (DATETIME, DEFAULT CURRENT_TIMESTAMP)
+- `deleted` (BOOLEAN, DEFAULT 0)
 
-1. **Trích xuất tiêu đề (Extract Title):** Phân tích URL để lấy `book_title`.
-2. **Kiểm tra trùng lặp (Duplicate Check):** Kiểm tra `title` trong DB. Bỏ qua và báo lỗi nếu sách đã tồn tại.
-3. **Định danh Thư mục (Folder Resolution):** Kiểm tra `googleFolderId` gửi từ client. Nếu có, đối chiếu và lưu vào bảng `gg_folder` để lấy ID quản lý nội bộ.
-4. **Cào dữ liệu (Scrape):** Fetch HTML và dùng Regex để tìm tất cả các link ảnh khớp định dạng yêu cầu (`https://cdn3.olm.vn*`).
-5. **Khởi tạo dữ liệu (Init DB):** Lưu thông tin vào bảng `book` để sinh `book_id`.
-6. **Cách ly thư mục (Isolation):** Tạo thư mục cục bộ độc lập `/downloads/book_{book_id}`.
-7. **Tải ảnh (Download):** Tải toàn bộ ảnh vào thư mục cách ly và lưu log vào `book_page`.
-8. **Nén file (Zip):** Nén thư mục thành `book_{book_id}.zip`.
-9. **Tải lên Cloud (Upload):** Đẩy file ZIP lên Google Drive (vào đúng `googleFolderId` nếu được chỉ định) và lưu link vào `gg_drive`.
-10. **Dọn dẹp (Cleanup):** Xóa toàn bộ thư mục ảnh và file ZIP cục bộ để tối ưu dung lượng máy chủ.
+## 4. Business Logic Workflow
 
-## 5. Đặc tả API (API Specification)
+The downloader processes each input URL sequentially through the following pipeline:
 
-### 5.1 Endpoint: Tải và xử lý sách
+1. **Title Extraction:** Analyzes the target URL to extract the book's slug as `title`.
+2. **Duplicate Check:** Queries the database for the book `title`. If it already exists (and `deleted = 0`), skips processing and reports a duplicate error.
+3. **Folder Resolution:** Resolves target Google Drive folder using the `GOOGLE_FOLDER_ID` env variable. Looks up or creates folder record in `gg_folder` table.
+4. **Scraping:** Fetches target HTML and extracts image links using regular expressions matching the OLM CDN pattern (`https://cdn3.olm.vn*`).
+5. **Database Initialization:** Inserts a new row in the `book` table to obtain a unique `book_id`.
+6. **Folder Isolation:** Creates a temporary, isolated workspace directory `/downloads/book_{book_id}`.
+7. **Sequential Download:** Downloads each image one-by-one into the isolated directory, storing a row in `book_page` for each page.
+8. **Compression:** Compresses the isolated directory into `book_{book_id}.zip`.
+9. **Google Drive Upload:** Uploads the zip archive to Google Drive. Returns the web link and records it in the `gg_drive` table.
+10. **Cleanup:** Inside a `finally` block, deletes the local book subdirectory and its zip file.
 
-- **URL:** `/api/books/download`
-- **Method:** `POST`
-- **Content-Type:** `application/json`
+## 5. API Specification
 
-#### Request Payload
+Interactive Swagger UI documentation is available at `/api/docs`.
 
-Hỗ trợ truyền một URL hoặc một mảng URLs, kèm theo ID thư mục đích tùy chọn.
+### 5.1 POST `/api/books/download`
+Downloads and archives books.
 
+- **Request Body (JSON):**
 ```json
 {
-  "googleFolderId": "1a2b3c4d5e6f7g8h9i0j_ABCXYZ",
+  "targetUrl": "https://taphuan.nxbgd.vn/tap-huan/doc-sach/shs-toan-5-tap-mot.123456",
   "targetUrls": [
-    "https://taphuan.nxbgd.vn/tap-huan/doc-sach/shs-tieng-viet-5-tap-hai.4537689926",
-    "https://taphuan.nxbgd.vn/tap-huan/doc-sach/shs-toan-5-tap-mot.123456"
+    "https://taphuan.nxbgd.vn/tap-huan/doc-sach/shs-tieng-viet-5-tap-hai.4537689926"
   ]
 }
 ```
+*Either `targetUrl` or `targetUrls` can be supplied.*
 
-_(Ghi chú: Có thể bỏ qua `googleFolderId` nếu muốn lưu ở Root. Có thể dùng `targetUrl` (chuỗi) thay cho `targetUrls` (mảng) nếu chỉ tải 1 sách)._
-
-#### Response Payload
-
-Trả về chi tiết trạng thái của từng URL mà không làm gián đoạn tiến trình chung.
-
+- **Response Body (JSON - Success 200):**
 ```json
 {
   "success": true,
-  "message": "Đã xử lý xong. Thành công: 1/2",
+  "message": "Processing completed. Success: 1/1",
   "results": {
     "success": [
       {
         "url": "https://taphuan.nxbgd.vn/tap-huan/doc-sach/shs-toan-5-tap-mot.123456",
-        "status": "Thành công",
-        "bookId": 2,
+        "status": "Success",
+        "bookId": 1,
         "bookTitle": "shs-toan-5-tap-mot",
         "totalPages": 120,
-        "googleFolderId": "1a2b3c4d5e6f7g8h9i0j_ABCXYZ",
-        "driveLink": "https://drive.google.com/file/d/.../view"
+        "googleFolderId": "folder_id_xyz",
+        "driveLink": "https://drive.google.com/file/d/mock_id/view"
       }
     ],
-    "failed": [
-      {
-        "url": "https://taphuan.nxbgd.vn/tap-huan/doc-sach/shs-tieng-viet-5-tap-hai.4537689926",
-        "status": "Thất bại",
-        "error": "Sách với title \"shs-tieng-viet-5-tap-hai\" đã tồn tại trong hệ thống (Trùng lặp)."
-      }
-    ]
+    "failed": []
   }
 }
 ```
 
-## 6. Biến môi trường & Phân quyền (Environment & Auth)
+### 5.2 GET `/api/books`
+Retrieves a list of all active books.
+- **Response Body (JSON - Success 200):** `BookListItemDto[]`
 
-- **Xác thực Google API:** Yêu cầu file `credentials.json` (Google Service Account Key) đặt tại thư mục gốc.
-- **Quyền truy cập Drive:** Tài khoản Service Account cần được cấp quyền (Share/Editor) vào thư mục đích trên Google Drive nếu người dùng truyền lên `googleFolderId`.
-- **Cổng dịch vụ:** Cấu hình qua biến môi trường `PORT` (Mặc định: `3000`).
+### 5.3 GET `/api/books/:id`
+Retrieves details of a specific book, including pages list.
+- **Response Body (JSON - Success 200):** `BookDetailResponseDto`
+- **Response status 404:** Book not found.
+
+### 5.4 DELETE `/api/books/:id`
+Soft-deletes a book and its page/drive link mappings from the database.
+- **Response Body (JSON - Success 200):** `DeleteBookResponseDto`
+- **Response status 404:** Book not found.
+
+## 6. Environment & Authentication
+
+- **Google Drive Authentication:**
+  - Loads Service Account keys from the `GOOGLE_CREDENTIALS_JSON` env variable (optionally base64 encoded).
+  - Alternatively loads keys from `credentials.json` at root directory or the path specified in `GOOGLE_CREDENTIALS_PATH` env variable.
+- **Mock Fallback Mode:**
+  - If credentials are not configured, the service logs a warning and runs in **Mock Mode**, simulating Google Drive uploading and folder resolution for safe local testing.
+- **Server Port:** Configurable via `PORT` env variable (default is `3000`).
