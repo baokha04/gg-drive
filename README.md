@@ -1,98 +1,107 @@
-<p align="center">
-  <a href="http://nestjs.com/" target="blank"><img src="https://nestjs.com/img/logo-small.svg" width="120" alt="Nest Logo" /></a>
-</p>
+# gg-drive
 
-[circleci-image]: https://img.shields.io/circleci/build/github/nestjs/nest/master?token=abc123def456
-[circleci-url]: https://circleci.com/gh/nestjs/nest
+Book Downloader Service built on NestJS. Accepts one or more web URLs of
+reading material, scrapes target page image links, downloads them
+sequentially to the local server, and compresses them into a ZIP archive.
+Processing is asynchronous through a SQLite-backed job queue.
 
-  <p align="center">A progressive <a href="http://nodejs.org" target="_blank">Node.js</a> framework for building efficient and scalable server-side applications.</p>
-    <p align="center">
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/v/@nestjs/core.svg" alt="NPM Version" /></a>
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/l/@nestjs/core.svg" alt="Package License" /></a>
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/dm/@nestjs/common.svg" alt="NPM Downloads" /></a>
-<a href="https://circleci.com/gh/nestjs/nest" target="_blank"><img src="https://img.shields.io/circleci/build/github/nestjs/nest/master" alt="CircleCI" /></a>
-<a href="https://discord.gg/G7Qnnhy" target="_blank"><img src="https://img.shields.io/badge/discord-online-brightgreen.svg" alt="Discord"/></a>
-<a href="https://opencollective.com/nest#backer" target="_blank"><img src="https://opencollective.com/nest/backers/badge.svg" alt="Backers on Open Collective" /></a>
-<a href="https://opencollective.com/nest#sponsor" target="_blank"><img src="https://opencollective.com/nest/sponsors/badge.svg" alt="Sponsors on Open Collective" /></a>
-  <a href="https://paypal.me/kamilmysliwiec" target="_blank"><img src="https://img.shields.io/badge/Donate-PayPal-ff3f59.svg" alt="Donate us"/></a>
-    <a href="https://opencollective.com/nest#sponsor"  target="_blank"><img src="https://img.shields.io/badge/Support%20us-Open%20Collective-41B883.svg" alt="Support us"></a>
-  <a href="https://twitter.com/nestframework" target="_blank"><img src="https://img.shields.io/twitter/follow/nestframework.svg?style=social&label=Follow" alt="Follow us on Twitter"></a>
-</p>
-  <!--[![Backers on Open Collective](https://opencollective.com/nest/backers/badge.svg)](https://opencollective.com/nest#backer)
-  [![Sponsors on Open Collective](https://opencollective.com/nest/sponsors/badge.svg)](https://opencollective.com/nest#sponsor)-->
-
-## Description
-
-[Nest](https://github.com/nestjs/nest) framework TypeScript starter repository.
-
-## Project setup
+## Quick Start
 
 ```bash
-$ pnpm install
+pnpm install
+pnpm run start:dev
 ```
 
-## Compile and run the project
+The server boots on `http://localhost:3000` (override with `PORT`).
+
+Interactive Swagger UI is at `http://localhost:3000/api/docs`.
+
+## Environment
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `PORT` | `3000` | HTTP port |
+
+The service stores its SQLite database at `./database.db` (created on first
+boot) and downloaded page archives under `./downloads/`.
+
+## API
+
+All endpoints are mounted under `/api/books`.
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `POST` | `/download` | Queue one or more book URLs for download. |
+| `GET` | `/download/status/:id` | Get progress of a queued job. |
+| `GET` | `/download/steps` | Get the download pipeline step order. |
+| `GET` | `/download/jobs?status=` | List jobs, optionally filtered by status. |
+| `POST` | `/download/retry/:id` | Retry a `failed` job from scratch. |
+| `POST` | `/download/retry/:id/step` | Retry a `failed` job from a specific step. |
+| `GET` | `/` | List all non-deleted books. |
+| `GET` | `/:id` | Get a book with its pages. |
+| `DELETE` | `/:id` | Soft-delete a book and its pages. |
+
+### Queue a download
 
 ```bash
-# development
-$ pnpm run start
-
-# watch mode
-$ pnpm run start:dev
-
-# production mode
-$ pnpm run start:prod
+curl -X POST http://localhost:3000/api/books/download \
+  -H 'Content-Type: application/json' \
+  -d '{"targetUrl":"https://taphuan.nxbgd.vn/tap-huan/doc-sach/shs-toan-5-tap-mot.123456"}'
 ```
 
-## Run tests
+A single URL can be passed as `targetUrl`; multiple URLs as `targetUrls`.
+
+Duplicate URLs are resumed, not failed: if a book with the same `url` (or the
+same `title`) already exists, the new job reuses the existing record and only
+downloads the missing pages. See
+[`docs/decisions/0006-duplicate-book-resume-policy.md`](docs/decisions/0006-duplicate-book-resume-policy.md).
+
+## Validation
 
 ```bash
-# unit tests
-$ pnpm run test
-
-# e2e tests
-$ pnpm run test:e2e
-
-# test coverage
-$ pnpm run test:cov
+pnpm run validate:quick   # format:check + unit tests + build
+pnpm run test:e2e         # full app + in-memory SQLite
+pnpm run lint             # auto-fix ESLint issues
+pnpm run lint:check       # strict check (pre-existing type noise)
 ```
 
-## Deployment
+## Architecture
 
-When you're ready to deploy your NestJS application to production, there are some key steps you can take to ensure it runs as efficiently as possible. Check out the [deployment documentation](https://docs.nestjs.com/deployment) for more information.
+The downloader is split into an orchestrator and four leaf services:
 
-If you are looking for a cloud-based platform to deploy your NestJS application, check out [Mau](https://mau.nestjs.com), our official platform for deploying NestJS applications on AWS. Mau makes deployment straightforward and fast, requiring just a few simple steps:
-
-```bash
-$ pnpm install -g @nestjs/mau
-$ mau deploy
+```
+src/book-downloader/
+  book-downloader.service.ts          # orchestrator, worker loop, public API
+  book-downloader.controller.ts       # REST surface
+  book-downloader.module.ts
+  services/
+    book-scraper.service.ts           # HTML fetch + OLM CDN image extraction
+    page-downloader.service.ts        # sequential image download with retry
+    archive.service.ts                # ZIP compression (archiver, level 9)
+    book-resolver.service.ts          # duplicate detection + book/page records
 ```
 
-With Mau, you can deploy your application in just a few clicks, allowing you to focus on building features rather than managing infrastructure.
+The pipeline is `RESOLVE_BOOK → SCRAPE_PAGES → INIT_BOOK_RECORD →
+DOWNLOAD_PAGES → ZIP_DIRECTORY`. Each step records its current state on
+`download_job.current_step`, which is what the step-level retry endpoint
+consumes.
 
-## Resources
+## Docs
 
-Check out a few resources that may come in handy when working with NestJS:
+- [`docs/spec_description.md`](docs/spec_description.md) — full product spec.
+- [`docs/HARNESS.md`](docs/HARNESS.md) — operating harness for humans and agents.
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — layering and boundary rules.
+- [`docs/decisions/`](docs/decisions) — durable decision records.
+- [`docs/stories/`](docs/stories) — story packets and validation evidence.
 
-- Visit the [NestJS Documentation](https://docs.nestjs.com) to learn more about the framework.
-- For questions and support, please visit our [Discord channel](https://discord.gg/G7Qnnhy).
-- To dive deeper and get more hands-on experience, check out our official video [courses](https://courses.nestjs.com/).
-- Deploy your application to AWS with the help of [NestJS Mau](https://mau.nestjs.com) in just a few clicks.
-- Visualize your application graph and interact with the NestJS application in real-time using [NestJS Devtools](https://devtools.nestjs.com).
-- Need help with your project (part-time to full-time)? Check out our official [enterprise support](https://enterprise.nestjs.com).
-- To stay in the loop and get updates, follow us on [X](https://x.com/nestframework) and [LinkedIn](https://linkedin.com/company/nestjs).
-- Looking for a job, or have a job to offer? Check out our official [Jobs board](https://jobs.nestjs.com).
+## Tech Stack
 
-## Support
-
-Nest is an MIT-licensed open source project. It can grow thanks to the sponsors and support by the amazing backers. If you'd like to join them, please [read more here](https://docs.nestjs.com/support).
-
-## Stay in touch
-
-- Author - [Kamil Myśliwiec](https://twitter.com/kammysliwiec)
-- Website - [https://nestjs.com](https://nestjs.com/)
-- Twitter - [@nestframework](https://twitter.com/nestframework)
+- **Runtime**: Node.js, NestJS 11.
+- **Database**: SQLite3 (raw driver, promise-wrapped).
+- **HTTP**: Axios (HTML fetch + streaming image download).
+- **Archive**: Archiver (ZIP, level 9).
+- **Docs**: Swagger via `@nestjs/swagger`.
 
 ## License
 
-Nest is [MIT licensed](https://github.com/nestjs/nest/blob/master/LICENSE).
+UNLICENSED — internal project.

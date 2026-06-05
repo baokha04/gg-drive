@@ -1,14 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { DatabaseService } from '../database/database.service';
 import {
-  extractTitleFromUrl,
-  removeVietnameseAccents,
-} from '../common/string.utils';
-import axios from 'axios';
-import * as fs from 'fs';
-import * as path from 'path';
-import archiver from 'archiver';
-import {
   IBook,
   IBookPage,
   IDownloadJob,
@@ -23,6 +15,13 @@ import {
   DownloadJobDto,
   StepsListDto,
 } from './dto/download-job.dto';
+import { extractTitleFromUrl } from '../common/string.utils';
+import * as fs from 'fs';
+import * as path from 'path';
+import { BookScraperService } from './services/book-scraper.service';
+import { PageDownloaderService } from './services/page-downloader.service';
+import { ArchiveService } from './services/archive.service';
+import { BookResolverService } from './services/book-resolver.service';
 
 interface StepContext {
   jobId: number;
@@ -49,7 +48,13 @@ export class BookDownloaderService {
     'ZIP_DIRECTORY',
   ];
 
-  constructor(private readonly databaseService: DatabaseService) {}
+  constructor(
+    private readonly databaseService: DatabaseService,
+    private readonly bookScraper: BookScraperService,
+    private readonly pageDownloader: PageDownloaderService,
+    private readonly archiveService: ArchiveService,
+    private readonly bookResolver: BookResolverService,
+  ) {}
 
   async downloadAndStoreBooks(
     targetUrls: string[],
@@ -57,7 +62,6 @@ export class BookDownloaderService {
     const queuedJobs: QueuedJobItemDto[] = [];
 
     for (const url of targetUrls) {
-      // Check if an active job (pending/processing) already exists for this URL
       const existingJob = await this.databaseService.get<IDownloadJob>(
         'SELECT id, url, status FROM download_job WHERE url = ? AND status IN (?, ?) ORDER BY id DESC LIMIT 1',
         [url, 'pending', 'processing'],
@@ -86,10 +90,173 @@ export class BookDownloaderService {
       });
     }
 
-    // Trigger worker asynchronously
     this.startWorker();
 
     return queuedJobs;
+  }
+
+  getStepsList(): StepsListDto {
+    return { steps: [...this.STEP_PIPELINE] };
+  }
+
+  async findJobById(id: number): Promise<DownloadJobDto | null> {
+    const job = await this.databaseService.get<IDownloadJob>(
+      'SELECT id, url, status, total_pages, current_page, book_id, error_message, current_step, created_at, updated_at FROM download_job WHERE id = ?',
+      [id],
+    );
+    if (!job) {
+      return null;
+    }
+    return this.toJobDto(job);
+  }
+
+  async findAllJobs(status?: string): Promise<DownloadJobDto[]> {
+    let sql =
+      'SELECT id, url, status, total_pages, current_page, book_id, error_message, current_step, created_at, updated_at FROM download_job';
+    const params: any[] = [];
+
+    if (status) {
+      sql += ' WHERE status = ?';
+      params.push(status);
+    }
+
+    sql += ' ORDER BY id DESC';
+
+    const jobs = await this.databaseService.query<IDownloadJob>(sql, params);
+    return jobs.map((j) => this.toJobDto(j));
+  }
+
+  async findAllBooks(): Promise<BookListItemDto[]> {
+    return this.databaseService.query<BookListItemDto>(`
+      SELECT b.id, b.title, b.description, b.unsign_title, b.url, b.total_pages, b.created_at, b.updated_at
+      FROM book b
+      WHERE b.deleted = 0
+      ORDER BY b.created_at DESC
+    `);
+  }
+
+  async findBookById(id: number): Promise<BookDetailResponseDto | null> {
+    const book = await this.databaseService.get<BookListItemDto>(
+      `
+      SELECT b.id, b.title, b.description, b.unsign_title, b.url, b.total_pages, b.created_at, b.updated_at
+      FROM book b
+      WHERE b.id = ? AND b.deleted = 0
+    `,
+      [id],
+    );
+
+    if (!book) {
+      return null;
+    }
+
+    const pages = await this.databaseService.query<IBookPage>(
+      `
+      SELECT id, page_number, image_url, download_url, created_at, updated_at
+      FROM book_page
+      WHERE book_id = ? AND deleted = 0
+      ORDER BY page_number ASC
+    `,
+      [id],
+    );
+
+    return {
+      ...book,
+      pages: pages.map((p) => ({
+        id: p.id,
+        page_number: p.page_number,
+        image_url: p.image_url,
+        download_url: p.download_url || '',
+        created_at: p.created_at,
+        updated_at: p.updated_at,
+      })),
+    };
+  }
+
+  async softDeleteBook(id: number): Promise<boolean> {
+    const book = await this.databaseService.get<IBook>(
+      'SELECT id FROM book WHERE id = ? AND deleted = 0',
+      [id],
+    );
+    if (!book) {
+      return false;
+    }
+
+    await this.databaseService.run(
+      'UPDATE book SET deleted = 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
+      [id],
+    );
+    await this.databaseService.run(
+      'UPDATE book_page SET deleted = 1, updated_at = CURRENT_TIMESTAMP WHERE book_id = ?',
+      [id],
+    );
+
+    return true;
+  }
+
+  async retryJob(id: number): Promise<DownloadJobDto | null> {
+    const job = await this.databaseService.get<IDownloadJob>(
+      'SELECT * FROM download_job WHERE id = ?',
+      [id],
+    );
+
+    if (!job) {
+      return null;
+    }
+
+    if (job.status !== 'failed') {
+      throw new Error(
+        `Job ${id} cannot be retried — current status is '${job.status}'. Only 'failed' jobs can be retried.`,
+      );
+    }
+
+    await this.databaseService.run(
+      'UPDATE download_job SET status = ?, error_message = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
+      ['pending', id],
+    );
+
+    this.logger.log(`Job ${id} reset to pending for retry.`);
+
+    this.startWorker();
+
+    return this.findJobById(id);
+  }
+
+  async retryJobStep(
+    id: number,
+    step: JobStep,
+  ): Promise<DownloadJobDto | null> {
+    const job = await this.databaseService.get<IDownloadJob>(
+      'SELECT * FROM download_job WHERE id = ?',
+      [id],
+    );
+
+    if (!job) return null;
+
+    if (job.status !== 'failed') {
+      throw new Error(
+        `Job ${id} cannot be retried — current status is '${job.status}'. Only 'failed' jobs can be retried.`,
+      );
+    }
+
+    if (!this.STEP_PIPELINE.includes(step)) {
+      throw new Error(
+        `Invalid step '${step}'. Valid steps: ${this.STEP_PIPELINE.join(', ')}`,
+      );
+    }
+
+    await this.cleanupForStep(job, step);
+
+    await this.databaseService.run(
+      'UPDATE download_job SET status = ?, current_step = ?, error_message = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
+      ['pending', step, id],
+    );
+
+    this.logger.log(
+      `Job ${id} reset to pending for retry from step '${step}'.`,
+    );
+    this.startWorker();
+
+    return this.findJobById(id);
   }
 
   private async startWorker() {
@@ -176,7 +343,6 @@ export class BookDownloaderService {
       throw new Error('Failed to extract book title from URL.');
     }
 
-    // Load existing job to check for previously assigned book_id
     const job = await this.databaseService.get<IDownloadJob>(
       'SELECT book_id FROM download_job WHERE id = ?',
       [jobId],
@@ -248,10 +414,8 @@ export class BookDownloaderService {
     if (ctx.imageUrls && ctx.imageUrls.length > 0) {
       return;
     }
-    const htmlContent = await this.fetchHtml(ctx.url);
-    const regex = /https:\/\/cdn3\.olm\.vn\/[^\s"']+/g;
-    const matches = htmlContent.match(regex) || [];
-    ctx.imageUrls = Array.from(new Set(matches));
+    const htmlContent = await this.bookScraper.fetchHtml(ctx.url);
+    ctx.imageUrls = this.bookScraper.extractImageUrls(htmlContent);
 
     if (ctx.imageUrls.length === 0) {
       throw new Error(
@@ -263,36 +427,15 @@ export class BookDownloaderService {
     );
   }
 
-  private async fetchHtml(url: string): Promise<string> {
-    this.logger.log(`Fetching HTML from URL: ${url}`);
-    try {
-      const response = await axios.get(url, {
-        headers: {
-          'User-Agent':
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36',
-        },
-        timeout: 15000,
-      });
-      return response.data;
-    } catch (err) {
-      throw new Error(`Failed to access the book URL: ${err.message}`);
-    }
-  }
-
   private async stepResolveBook(ctx: StepContext): Promise<void> {
-    const existingBookByUrl = await this.databaseService.get<IBook>(
-      'SELECT * FROM book WHERE url = ? AND deleted = 0',
-      [ctx.url],
-    );
-    const existingBookByTitle = !existingBookByUrl
-      ? await this.databaseService.get<IBook>(
-          'SELECT * FROM book WHERE title = ? AND deleted = 0',
-          [ctx.title],
-        )
+    const existingByUrl = await this.bookResolver.findByUrl(ctx.url);
+    const existingByTitle = !existingByUrl
+      ? await this.bookResolver.findByTitle(ctx.title)
       : null;
+    const existing = existingByUrl || existingByTitle;
 
-    if (existingBookByUrl) {
-      ctx.bookId = existingBookByUrl.id;
+    if (existing) {
+      ctx.bookId = existing.id;
       ctx.isResuming = true;
       ctx.bookDirPath = path.join(ctx.downloadsBaseDir, `book_${ctx.bookId}`);
       ctx.zipPath = path.join(ctx.downloadsBaseDir, `book_${ctx.bookId}.zip`);
@@ -302,20 +445,7 @@ export class BookDownloaderService {
         [ctx.bookId, ctx.jobId],
       );
       this.logger.log(
-        `Book already exists for URL (ID: ${ctx.bookId}). Resuming from existing record.`,
-      );
-    } else if (existingBookByTitle) {
-      ctx.bookId = existingBookByTitle.id;
-      ctx.isResuming = true;
-      ctx.bookDirPath = path.join(ctx.downloadsBaseDir, `book_${ctx.bookId}`);
-      ctx.zipPath = path.join(ctx.downloadsBaseDir, `book_${ctx.bookId}.zip`);
-
-      await this.databaseService.run(
-        'UPDATE download_job SET book_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
-        [ctx.bookId, ctx.jobId],
-      );
-      this.logger.log(
-        `Book already exists with title "${ctx.title}" (ID: ${ctx.bookId}). Resuming from existing record.`,
+        `Book already exists (ID: ${ctx.bookId}). Resuming from existing record.`,
       );
     } else {
       ctx.bookId = 0;
@@ -326,7 +456,6 @@ export class BookDownloaderService {
   private async stepScrapePages(ctx: StepContext): Promise<void> {
     await this.ensureImageUrls(ctx);
 
-    // Update job total pages
     await this.databaseService.run(
       'UPDATE download_job SET total_pages = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
       [ctx.imageUrls.length, ctx.jobId],
@@ -337,18 +466,11 @@ export class BookDownloaderService {
     await this.ensureImageUrls(ctx);
 
     if (!ctx.isResuming && ctx.bookId === 0) {
-      const unsignTitle = removeVietnameseAccents(ctx.title);
-      const bookRes = await this.databaseService.run(
-        'INSERT INTO book (title, description, unsign_title, url, total_pages) VALUES (?, ?, ?, ?, ?)',
-        [
-          ctx.title,
-          `Book downloaded from ${ctx.url}`,
-          unsignTitle,
-          ctx.url,
-          ctx.imageUrls.length,
-        ],
-      );
-      ctx.bookId = bookRes.lastID;
+      ctx.bookId = await this.bookResolver.createBook({
+        title: ctx.title,
+        url: ctx.url,
+        totalPages: ctx.imageUrls.length,
+      });
       ctx.bookDirPath = path.join(ctx.downloadsBaseDir, `book_${ctx.bookId}`);
       ctx.zipPath = path.join(ctx.downloadsBaseDir, `book_${ctx.bookId}.zip`);
 
@@ -357,37 +479,30 @@ export class BookDownloaderService {
         [ctx.bookId, ctx.jobId],
       );
       this.logger.log(`Created new book record with ID: ${ctx.bookId}`);
-    } else {
-      // Rebuild paths and update total pages for existing book record
-      if (ctx.bookId === 0) {
-        const existingBook = await this.databaseService.get<IBook>(
-          'SELECT id FROM book WHERE url = ? AND deleted = 0',
-          [ctx.url],
-        );
-        if (existingBook) {
-          ctx.bookId = existingBook.id;
-          ctx.isResuming = true;
-          await this.databaseService.run(
-            'UPDATE download_job SET book_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
-            [ctx.bookId, ctx.jobId],
-          );
-        } else {
-          // Force creation if fallback fails
-          ctx.isResuming = false;
-          await this.stepInitBookRecord(ctx);
-          return;
-        }
-      }
-
-      ctx.bookDirPath = path.join(ctx.downloadsBaseDir, `book_${ctx.bookId}`);
-      ctx.zipPath = path.join(ctx.downloadsBaseDir, `book_${ctx.bookId}.zip`);
-
-      await this.databaseService.run(
-        'UPDATE book SET total_pages = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
-        [ctx.imageUrls.length, ctx.bookId],
-      );
-      this.logger.log(`Reusing existing book record with ID: ${ctx.bookId}`);
+      return;
     }
+
+    if (ctx.bookId === 0) {
+      const existing = await this.bookResolver.findByUrl(ctx.url);
+      if (existing) {
+        ctx.bookId = existing.id;
+        ctx.isResuming = true;
+        await this.databaseService.run(
+          'UPDATE download_job SET book_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
+          [ctx.bookId, ctx.jobId],
+        );
+      } else {
+        ctx.isResuming = false;
+        await this.stepInitBookRecord(ctx);
+        return;
+      }
+    }
+
+    ctx.bookDirPath = path.join(ctx.downloadsBaseDir, `book_${ctx.bookId}`);
+    ctx.zipPath = path.join(ctx.downloadsBaseDir, `book_${ctx.bookId}.zip`);
+
+    await this.bookResolver.updateTotalPages(ctx.bookId, ctx.imageUrls.length);
+    this.logger.log(`Reusing existing book record with ID: ${ctx.bookId}`);
   }
 
   private async stepDownloadPages(ctx: StepContext): Promise<void> {
@@ -399,31 +514,22 @@ export class BookDownloaderService {
     ctx.bookDirPath = path.join(ctx.downloadsBaseDir, `book_${ctx.bookId}`);
     fs.mkdirSync(ctx.bookDirPath, { recursive: true });
 
-    // Get already downloaded pages for resume support
-    const existingPages = await this.databaseService.query<IBookPage>(
-      'SELECT page_number FROM book_page WHERE book_id = ? AND deleted = 0',
-      [ctx.bookId],
-    );
-    const downloadedPageNumbers = new Set(
-      existingPages.map((p) => p.page_number),
-    );
+    const downloadedPageNumbers =
+      await this.bookResolver.getDownloadedPageNumbers(ctx.bookId);
     if (downloadedPageNumbers.size > 0) {
       this.logger.log(
         `Found ${downloadedPageNumbers.size} already downloaded pages. Will skip those.`,
       );
     }
 
-    // Download images sequentially (skip already downloaded)
     for (let i = 0; i < ctx.imageUrls.length; i++) {
       const imageUrl = ctx.imageUrls[i];
       const pageNumber = i + 1;
 
-      // Skip already downloaded pages
       if (downloadedPageNumbers.has(pageNumber)) {
         this.logger.log(
           `Page ${pageNumber}/${ctx.imageUrls.length} already downloaded. Skipping.`,
         );
-        // Sync progress in DB if it was lost/lower
         await this.databaseService.run(
           'UPDATE download_job SET current_page = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND current_page < ?',
           [pageNumber, ctx.jobId, pageNumber],
@@ -443,19 +549,19 @@ export class BookDownloaderService {
       this.logger.log(
         `Downloading page ${pageNumber}/${ctx.imageUrls.length}: ${imageUrl}`,
       );
-      await this.downloadImageWithRetry(imageUrl, destPath);
+      await this.pageDownloader.downloadImageWithRetry(imageUrl, destPath);
 
       const dbDownloadUrl = path
         .relative(process.cwd(), destPath)
         .replace(/\\/g, '/');
 
-      // Log page to DB
-      await this.databaseService.run(
-        'INSERT INTO book_page (book_id, page_number, image_url, download_url) VALUES (?, ?, ?, ?)',
-        [ctx.bookId, pageNumber, imageUrl, dbDownloadUrl],
+      await this.bookResolver.recordPage(
+        ctx.bookId,
+        pageNumber,
+        imageUrl,
+        dbDownloadUrl,
       );
 
-      // Update job current page progress
       await this.databaseService.run(
         'UPDATE download_job SET current_page = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
         [pageNumber, ctx.jobId],
@@ -471,77 +577,7 @@ export class BookDownloaderService {
     ctx.zipPath = path.join(ctx.downloadsBaseDir, `book_${ctx.bookId}.zip`);
 
     this.logger.log(`Compressing pages into ZIP: ${ctx.zipPath}`);
-    await this.zipDirectory(ctx.bookDirPath, ctx.zipPath);
-  }
-
-  private async downloadImageWithRetry(
-    url: string,
-    destPath: string,
-    retries = 3,
-  ): Promise<void> {
-    for (let attempt = 1; attempt <= retries; attempt++) {
-      const writer = fs.createWriteStream(destPath);
-      try {
-        const response = await axios({
-          url,
-          method: 'GET',
-          responseType: 'stream',
-          headers: {
-            'User-Agent':
-              'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36',
-          },
-          timeout: 10000,
-        });
-
-        response.data.pipe(writer);
-
-        await new Promise<void>((resolve, reject) => {
-          writer.on('finish', resolve);
-          writer.on('error', (err) => {
-            writer.close();
-            reject(err);
-          });
-        });
-        return; // Success
-      } catch (error) {
-        writer.close();
-        if (fs.existsSync(destPath)) {
-          fs.unlinkSync(destPath);
-        }
-        if (attempt === retries) {
-          throw new Error(
-            `Failed to download page from ${url} after ${retries} attempts: ${error.message}`,
-          );
-        }
-        this.logger.warn(
-          `Download attempt ${attempt} failed for ${url}. Retrying in 1s...`,
-        );
-        await new Promise((resolve) => setTimeout(resolve, 1000));
-      }
-    }
-  }
-
-  private zipDirectory(sourceDir: string, outPath: string): Promise<void> {
-    return new Promise((resolve, reject) => {
-      const output = fs.createWriteStream(outPath);
-      const archive = archiver('zip', { zlib: { level: 9 } });
-
-      output.on('close', () => {
-        resolve();
-      });
-
-      archive.on('error', (err) => {
-        reject(err);
-      });
-
-      archive.pipe(output);
-      archive.directory(sourceDir, false);
-      archive.finalize();
-    });
-  }
-
-  getStepsList(): StepsListDto {
-    return { steps: [...this.STEP_PIPELINE] };
+    await this.archiveService.zipDirectory(ctx.bookDirPath, ctx.zipPath);
   }
 
   private async cleanupForStep(
@@ -589,52 +625,7 @@ export class BookDownloaderService {
     }
   }
 
-  async retryJobStep(
-    id: number,
-    step: JobStep,
-  ): Promise<DownloadJobDto | null> {
-    const job = await this.databaseService.get<IDownloadJob>(
-      'SELECT * FROM download_job WHERE id = ?',
-      [id],
-    );
-
-    if (!job) return null;
-
-    if (job.status !== 'failed') {
-      throw new Error(
-        `Job ${id} cannot be retried — current status is '${job.status}'. Only 'failed' jobs can be retried.`,
-      );
-    }
-
-    if (!this.STEP_PIPELINE.includes(step)) {
-      throw new Error(
-        `Invalid step '${step}'. Valid steps: ${this.STEP_PIPELINE.join(', ')}`,
-      );
-    }
-
-    await this.cleanupForStep(job, step);
-
-    await this.databaseService.run(
-      'UPDATE download_job SET status = ?, current_step = ?, error_message = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
-      ['pending', step, id],
-    );
-
-    this.logger.log(
-      `Job ${id} reset to pending for retry from step '${step}'.`,
-    );
-    this.startWorker();
-
-    return this.findJobById(id);
-  }
-
-  async findJobById(id: number): Promise<DownloadJobDto | null> {
-    const job = await this.databaseService.get<IDownloadJob>(
-      'SELECT id, url, status, total_pages, current_page, book_id, error_message, current_step, created_at, updated_at FROM download_job WHERE id = ?',
-      [id],
-    );
-    if (!job) {
-      return null;
-    }
+  private toJobDto(job: IDownloadJob): DownloadJobDto {
     return {
       id: job.id,
       url: job.url,
@@ -647,137 +638,5 @@ export class BookDownloaderService {
       created_at: job.created_at,
       updated_at: job.updated_at,
     };
-  }
-
-  async findAllBooks(): Promise<BookListItemDto[]> {
-    return this.databaseService.query<BookListItemDto>(`
-      SELECT b.id, b.title, b.description, b.unsign_title, b.url, b.total_pages, b.created_at, b.updated_at
-      FROM book b
-      WHERE b.deleted = 0
-      ORDER BY b.created_at DESC
-    `);
-  }
-
-  async findBookById(id: number): Promise<BookDetailResponseDto | null> {
-    const book = await this.databaseService.get<BookListItemDto>(
-      `
-      SELECT b.id, b.title, b.description, b.unsign_title, b.url, b.total_pages, b.created_at, b.updated_at
-      FROM book b
-      WHERE b.id = ? AND b.deleted = 0
-    `,
-      [id],
-    );
-
-    if (!book) {
-      return null;
-    }
-
-    const pages = await this.databaseService.query<IBookPage>(
-      `
-      SELECT id, page_number, image_url, download_url, created_at, updated_at
-      FROM book_page
-      WHERE book_id = ? AND deleted = 0
-      ORDER BY page_number ASC
-    `,
-      [id],
-    );
-
-    return {
-      ...book,
-      pages: pages.map((p) => ({
-        id: p.id,
-        page_number: p.page_number,
-        image_url: p.image_url,
-        download_url: p.download_url || '',
-        created_at: p.created_at,
-        updated_at: p.updated_at,
-      })),
-    };
-  }
-
-  async softDeleteBook(id: number): Promise<boolean> {
-    const book = await this.databaseService.get<IBook>(
-      'SELECT id FROM book WHERE id = ? AND deleted = 0',
-      [id],
-    );
-    if (!book) {
-      return false;
-    }
-
-    await this.databaseService.run(
-      'UPDATE book SET deleted = 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
-      [id],
-    );
-    await this.databaseService.run(
-      'UPDATE book_page SET deleted = 1, updated_at = CURRENT_TIMESTAMP WHERE book_id = ?',
-      [id],
-    );
-
-    return true;
-  }
-
-  /**
-   * Retry a failed job — resets status to 'pending' and re-triggers the background worker.
-   * Only jobs with status 'failed' can be retried.
-   */
-  async retryJob(id: number): Promise<DownloadJobDto | null> {
-    const job = await this.databaseService.get<IDownloadJob>(
-      'SELECT * FROM download_job WHERE id = ?',
-      [id],
-    );
-
-    if (!job) {
-      return null;
-    }
-
-    if (job.status !== 'failed') {
-      throw new Error(
-        `Job ${id} cannot be retried — current status is '${job.status}'. Only 'failed' jobs can be retried.`,
-      );
-    }
-
-    // Reset job state for retry - keep current_page, total_pages, and current_step
-    await this.databaseService.run(
-      'UPDATE download_job SET status = ?, error_message = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
-      ['pending', id],
-    );
-
-    this.logger.log(`Job ${id} reset to pending for retry.`);
-
-    // Re-trigger worker
-    this.startWorker();
-
-    // Return updated job info
-    return this.findJobById(id);
-  }
-
-  /**
-   * Get all download jobs, optionally filtered by status.
-   */
-  async findAllJobs(status?: string): Promise<DownloadJobDto[]> {
-    let sql =
-      'SELECT id, url, status, total_pages, current_page, book_id, error_message, current_step, created_at, updated_at FROM download_job';
-    const params: any[] = [];
-
-    if (status) {
-      sql += ' WHERE status = ?';
-      params.push(status);
-    }
-
-    sql += ' ORDER BY id DESC';
-
-    const jobs = await this.databaseService.query<IDownloadJob>(sql, params);
-    return jobs.map((job) => ({
-      id: job.id,
-      url: job.url,
-      status: job.status,
-      total_pages: job.total_pages,
-      current_page: job.current_page,
-      book_id: job.book_id,
-      error_message: job.error_message || null,
-      current_step: job.current_step,
-      created_at: job.created_at,
-      updated_at: job.updated_at,
-    }));
   }
 }

@@ -317,18 +317,36 @@ A task is done only when:
 
 ## Future Validation Ladder
 
-No validation scripts exist yet. When implementation begins, the expected ladder
-is:
+The NestJS project ships with this ladder wired into `package.json`:
 
 ```text
-validate:quick
-  format, lint, typecheck, unit tests, architecture check
+pnpm run validate:quick
+  format:check, jest unit tests, nest build
 
+pnpm run test:e2e
+  jest --config ./test/jest-e2e.json
+
+pnpm run lint
+  eslint auto-fix across src/ and test/ (dev-time, not in validate:quick)
+
+pnpm run lint:check
+  eslint no-fix across src/ and test/ (strict, surfaces pre-existing type noise)
+```
+
+`validate:quick` is the fastest feedback loop an agent can run before claiming
+a story is ready. `test:e2e` is the slow path that exercises the full Nest
+application with an in-memory SQLite database. `lint:check` is intentionally
+**not** part of `validate:quick` because the codebase still carries
+pre-existing `recommendedTypeChecked` warnings on `axios`, `archiver`, and
+SQLite callbacks; the ladder should not fail on the first run because of that
+tech debt. Agents must not claim a layer passes until the corresponding command
+has been run.
+
+When the project grows further, the expected ladder becomes:
+
+```text
 test:integration
   backend, database, provider, or service checks as the stack requires
-
-test:e2e
-  user-visible end-to-end flows
 
 test:platform
   shell, mobile, desktop, or deployment smoke checks as the stack requires
@@ -336,5 +354,3 @@ test:platform
 test:release
   full suite, log checks, and performance smoke
 ```
-
-Agents must not claim these commands pass until they exist and have been run.

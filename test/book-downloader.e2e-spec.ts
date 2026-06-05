@@ -136,7 +136,7 @@ describe('BookDownloaderController (e2e)', () => {
       expect(pages.length).toBe(2);
     });
 
-    it('should queue and mark duplicate downloads as failed', async () => {
+    it('should resume and merge pages for a duplicate book URL', async () => {
       const mockHtml = `
         <html>
           <body>
@@ -156,9 +156,13 @@ describe('BookDownloaderController (e2e)', () => {
         .expect(200);
 
       const job1Id = firstRes.body.jobs[0].id;
-      await waitForJobToFinish(app.getHttpServer(), job1Id);
+      const job1Final = await waitForJobToFinish(app.getHttpServer(), job1Id);
 
-      // Queue second job (same URL -> duplicate title)
+      expect(job1Final.status).toBe('completed');
+      const originalBookId = job1Final.book_id;
+      expect(originalBookId).toBeDefined();
+
+      // Queue second job with the same URL — must resume/merge, not fail
       const secondRes = await request(app.getHttpServer())
         .post('/api/books/download')
         .send({
@@ -170,10 +174,25 @@ describe('BookDownloaderController (e2e)', () => {
       const job2Id = secondRes.body.jobs[0].id;
       const job2Final = await waitForJobToFinish(app.getHttpServer(), job2Id);
 
-      expect(job2Final.status).toBe('failed');
-      expect(job2Final.error_message).toContain(
-        'already exists in the system (Duplicate)',
+      expect(job2Final.status).toBe('completed');
+      expect(job2Final.error_message).toBeNull();
+      expect(job2Final.book_id).toBe(originalBookId);
+      expect(job2Final.total_pages).toBe(1);
+      expect(job2Final.current_page).toBe(1);
+
+      // Book row count must still be one
+      const bookCount = await dbService.get<{ c: number }>(
+        'SELECT COUNT(*) as c FROM book WHERE id = ?',
+        [originalBookId],
       );
+      expect((bookCount as any).c).toBe(1);
+
+      // Pages must be one (the page was already downloaded in the first run)
+      const pages = await dbService.query(
+        'SELECT * FROM book_page WHERE book_id = ?',
+        [originalBookId],
+      );
+      expect(pages.length).toBe(1);
     });
   });
 

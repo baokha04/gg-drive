@@ -62,6 +62,11 @@ harness.db-shm
 scripts/bin/harness-cli
 scripts/bin/harness-cli.exe
 
+# App SQLite database
+database.db
+database.db-wal
+database.db-shm
+
 # GG credentials.json
 credentials.json
 downloads/

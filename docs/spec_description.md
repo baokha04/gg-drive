@@ -64,7 +64,7 @@ The worker runs a loop processing `pending` jobs sequentially:
 1. Picks the next `pending` job ordered by ID.
 2. Updates the job status to `processing`.
 3. **Title Extraction:** Analyzes the target URL to extract the book's slug as `title`.
-4. **Duplicate Check:** Queries the database for the book `title`. If it exists (and `deleted = 0`), stops and marks the job as `failed` with a duplicate error.
+4. **Duplicate Check:** Queries the database for the book `url` first, then by `title` (only when no `url` match exists). If a non-deleted book is found, the job **resumes and merges** into the existing `book` record: the existing `book_id` is reused, `total_pages` is updated from the new scrape, and only missing pages are downloaded. This is the active product policy (see `docs/decisions/0006-duplicate-book-resume-policy.md`). The previous "fail with duplicate error" behavior has been retired.
 5. **Scraping:** Fetches target HTML and extracts image links using regular expressions matching the OLM CDN pattern (`https://cdn3.olm.vn*`).
 6. **Total Pages Update:** Updates the job record with the total page count.
 7. **Database Initialization:** Inserts a new row in the `book` table to obtain a unique `book_id`.
