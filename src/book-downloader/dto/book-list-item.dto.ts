@@ -38,27 +38,6 @@ export class BookListItemDto {
   total_pages: number;
 
   @ApiProperty({
-    description: 'The Google Drive ZIP file link.',
-    example: 'https://drive.google.com/...',
-    nullable: true,
-  })
-  zip_file_url: string | null;
-
-  @ApiProperty({
-    description: 'The Google Drive folder ID.',
-    example: '1a2b3c4d5e...',
-    nullable: true,
-  })
-  google_folder_id: string | null;
-
-  @ApiProperty({
-    description: 'The Google Drive folder name.',
-    example: 'Folder_1a2b3c',
-    nullable: true,
-  })
-  google_folder_name: string | null;
-
-  @ApiProperty({
     description: 'The creation timestamp in database.',
     example: '2026-06-05 08:30:00',
   })
@@ -116,4 +95,3 @@ export class BookDetailResponseDto extends BookListItemDto {
   })
   pages: BookPageDto[];
 }
-

@@ -2,7 +2,7 @@
 
 ## 1. Project Overview
 
-The Book Downloader Service is a RESTful API built on top of Node.js and NestJS. The core goal is to accept one or multiple web URLs of reading materials, scrape target page image links, sequentially download images to the local server, compress them into a ZIP archive, and upload the archive to Google Drive. The service uses SQLite for data persistence, storing metadata, folder mapping, download histories, and links to final uploaded archives.
+The Book Downloader Service is a RESTful API built on top of Node.js and NestJS. The core goal is to accept one or multiple web URLs of reading materials, scrape target page image links, sequentially download images to the local server, and compress them into a ZIP archive. To prevent long-running download blocking, the system processes downloads asynchronously via a database-backed job queue. The service uses SQLite for data persistence, storing metadata, download job statuses, and histories.
 
 ## 2. Tech Stack
 
@@ -10,12 +10,11 @@ The Book Downloader Service is a RESTful API built on top of Node.js and NestJS.
 - **Database:** SQLite3 (via the direct `sqlite3` driver wrapped in a custom async provider)
 - **HTTP Client:** Axios (for HTML crawling and streaming file downloads)
 - **Archiving:** Archiver (ZIP compression, Level 9)
-- **Cloud Storage:** Google APIs (Google Drive API v3)
 - **API Documentation:** Swagger (@nestjs/swagger)
 
 ## 3. Database Schema
 
-Four SQLite tables are defined and initialized automatically at startup:
+Three SQLite tables are defined and initialized automatically at startup:
 
 ### 3.1 Table `book`
 Stores general metadata for each scraped book:
@@ -40,46 +39,47 @@ Stores download details for individual pages:
 - `updated_at` (DATETIME, DEFAULT CURRENT_TIMESTAMP)
 - `deleted` (BOOLEAN, DEFAULT 0)
 
-### 3.3 Table `gg_folder`
-Stores mapping for Google Drive directories:
-- `id` (INTEGER, PK, AUTOINCREMENT)
-- `folder_id` (TEXT, UNIQUE, NOT NULL) - Google Drive folder unique identifier.
-- `folder_name` (TEXT, NOT NULL) - Resolved Google Drive folder name.
+### 3.3 Table `download_job`
+Tracks download requests, status, and page progress in the background queue:
+- `id` (INTEGER, PRIMARY KEY AUTOINCREMENT)
+- `url` (TEXT, NOT NULL) - Target book URL.
+- `status` (TEXT, NOT NULL) - 'pending', 'processing', 'completed', or 'failed'.
+- `total_pages` (INTEGER, DEFAULT 0) - Calculated total page count after HTML scraping.
+- `current_page` (INTEGER, DEFAULT 0) - Number of pages downloaded so far.
+- `book_id` (INTEGER, FK -> book.id) - Linked book ID upon completion.
+- `error_message` (TEXT) - Failure reason if job fails.
 - `created_at` (DATETIME, DEFAULT CURRENT_TIMESTAMP)
 - `updated_at` (DATETIME, DEFAULT CURRENT_TIMESTAMP)
-- `deleted` (BOOLEAN, DEFAULT 0)
-
-### 3.4 Table `gg_drive`
-Maps the final uploaded zip archive to the book and Google Drive folder:
-- `id` (INTEGER, PK, AUTOINCREMENT)
-- `book_id` (INTEGER, FK -> book.id)
-- `gg_folder_id` (INTEGER, FK -> gg_folder.id)
-- `zip_file_url` (TEXT, NOT NULL) - Drive view link.
-- `created_at` (DATETIME, DEFAULT CURRENT_TIMESTAMP)
-- `updated_at` (DATETIME, DEFAULT CURRENT_TIMESTAMP)
-- `deleted` (BOOLEAN, DEFAULT 0)
 
 ## 4. Business Logic Workflow
 
-The downloader processes each input URL sequentially through the following pipeline:
+### 4.1 Client Request & Queuing
+1. The client submits a download request (`POST /api/books/download`).
+2. The service immediately inserts jobs into the `download_job` table with a `pending` status.
+3. The API returns the job IDs and status `pending` to the client instantly, without blocking.
+4. An internal queue worker is triggered asynchronously in the background.
 
-1. **Title Extraction:** Analyzes the target URL to extract the book's slug as `title`.
-2. **Duplicate Check:** Queries the database for the book `title`. If it already exists (and `deleted = 0`), skips processing and reports a duplicate error.
-3. **Folder Resolution:** Resolves target Google Drive folder using the `GOOGLE_FOLDER_ID` env variable. Looks up or creates folder record in `gg_folder` table.
-4. **Scraping:** Fetches target HTML and extracts image links using regular expressions matching the OLM CDN pattern (`https://cdn3.olm.vn*`).
-5. **Database Initialization:** Inserts a new row in the `book` table to obtain a unique `book_id`.
-6. **Folder Isolation:** Creates a temporary, isolated workspace directory `/downloads/book_{book_id}`.
-7. **Sequential Download:** Downloads each image one-by-one into the isolated directory, storing a row in `book_page` for each page.
-8. **Compression:** Compresses the isolated directory into `book_{book_id}.zip`.
-9. **Google Drive Upload:** Uploads the zip archive to Google Drive. Returns the web link and records it in the `gg_drive` table.
-10. **Cleanup:** Inside a `finally` block, deletes the local book subdirectory and its zip file.
+### 4.2 Background Queue Worker Processing
+The worker runs a loop processing `pending` jobs sequentially:
+1. Picks the next `pending` job ordered by ID.
+2. Updates the job status to `processing`.
+3. **Title Extraction:** Analyzes the target URL to extract the book's slug as `title`.
+4. **Duplicate Check:** Queries the database for the book `title`. If it exists (and `deleted = 0`), stops and marks the job as `failed` with a duplicate error.
+5. **Scraping:** Fetches target HTML and extracts image links using regular expressions matching the OLM CDN pattern (`https://cdn3.olm.vn*`).
+6. **Total Pages Update:** Updates the job record with the total page count.
+7. **Database Initialization:** Inserts a new row in the `book` table to obtain a unique `book_id`.
+8. **Folder Isolation:** Creates a temporary, isolated workspace directory `/downloads/book_{book_id}`.
+9. **Sequential Download:** Downloads each image one-by-one into the isolated directory, storing a row in `book_page` and updating the job `current_page` field for progress tracking.
+10. **Compression:** Compresses the isolated directory into `book_{book_id}.zip`.
+11. **Completion Update:** Updates job status to `completed` and links the generated `book_id`.
+12. **Cleanup & Failure Handling:** Inside a `finally` block, deletes local workspaces and zip files. If an exception occurs, updates job status to `failed` and saves the `error_message`.
 
 ## 5. API Specification
 
 Interactive Swagger UI documentation is available at `/api/docs`.
 
 ### 5.1 POST `/api/books/download`
-Downloads and archives books.
+Queues book download tasks.
 
 - **Request Body (JSON):**
 ```json
@@ -90,49 +90,54 @@ Downloads and archives books.
   ]
 }
 ```
-*Either `targetUrl` or `targetUrls` can be supplied.*
 
 - **Response Body (JSON - Success 200):**
 ```json
 {
   "success": true,
-  "message": "Processing completed. Success: 1/1",
-  "results": {
-    "success": [
-      {
-        "url": "https://taphuan.nxbgd.vn/tap-huan/doc-sach/shs-toan-5-tap-mot.123456",
-        "status": "Success",
-        "bookId": 1,
-        "bookTitle": "shs-toan-5-tap-mot",
-        "totalPages": 120,
-        "googleFolderId": "folder_id_xyz",
-        "driveLink": "https://drive.google.com/file/d/mock_id/view"
-      }
-    ],
-    "failed": []
-  }
+  "message": "Books queued for download.",
+  "jobs": [
+    {
+      "id": 1,
+      "url": "https://taphuan.nxbgd.vn/tap-huan/doc-sach/shs-toan-5-tap-mot.123456",
+      "status": "pending"
+    }
+  ]
 }
 ```
 
-### 5.2 GET `/api/books`
+### 5.2 GET `/api/books/download/status/:id`
+Retrieves progress and status of a queued download job.
+
+- **Response Body (JSON - Success 200):**
+```json
+{
+  "id": 1,
+  "url": "https://taphuan.nxbgd.vn/tap-huan/doc-sach/shs-toan-5-tap-mot.123456",
+  "status": "processing",
+  "total_pages": 120,
+  "current_page": 45,
+  "book_id": null,
+  "error_message": null,
+  "created_at": "2026-06-05 08:30:00",
+  "updated_at": "2026-06-05 08:31:12"
+}
+```
+
+### 5.3 GET `/api/books`
 Retrieves a list of all active books.
 - **Response Body (JSON - Success 200):** `BookListItemDto[]`
 
-### 5.3 GET `/api/books/:id`
+### 5.4 GET `/api/books/:id`
 Retrieves details of a specific book, including pages list.
 - **Response Body (JSON - Success 200):** `BookDetailResponseDto`
 - **Response status 404:** Book not found.
 
-### 5.4 DELETE `/api/books/:id`
-Soft-deletes a book and its page/drive link mappings from the database.
+### 5.5 DELETE `/api/books/:id`
+Soft-deletes a book and its page records from the database.
 - **Response Body (JSON - Success 200):** `DeleteBookResponseDto`
 - **Response status 404:** Book not found.
 
-## 6. Environment & Authentication
+## 6. Environment
 
-- **Google Drive Authentication:**
-  - Loads Service Account keys from the `GOOGLE_CREDENTIALS_JSON` env variable (optionally base64 encoded).
-  - Alternatively loads keys from `credentials.json` at root directory or the path specified in `GOOGLE_CREDENTIALS_PATH` env variable.
-- **Mock Fallback Mode:**
-  - If credentials are not configured, the service logs a warning and runs in **Mock Mode**, simulating Google Drive uploading and folder resolution for safe local testing.
 - **Server Port:** Configurable via `PORT` env variable (default is `3000`).

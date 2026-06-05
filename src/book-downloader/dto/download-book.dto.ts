@@ -3,7 +3,8 @@ import { ApiPropertyOptional } from '@nestjs/swagger';
 export class DownloadBookDto {
   @ApiPropertyOptional({
     description: 'A single URL of the book to download.',
-    example: 'https://taphuan.nxbgd.vn/tap-huan/doc-sach/shs-toan-5-tap-mot.123456',
+    example:
+      'https://taphuan.nxbgd.vn/tap-huan/doc-sach/shs-toan-5-tap-mot.123456',
   })
   targetUrl?: string;
 

@@ -3,7 +3,8 @@ import { ApiProperty } from '@nestjs/swagger';
 export class DownloadSuccessItemDto {
   @ApiProperty({
     description: 'The URL of the processed book.',
-    example: 'https://taphuan.nxbgd.vn/tap-huan/doc-sach/shs-toan-5-tap-mot.123456',
+    example:
+      'https://taphuan.nxbgd.vn/tap-huan/doc-sach/shs-toan-5-tap-mot.123456',
   })
   url: string;
 
@@ -30,25 +31,13 @@ export class DownloadSuccessItemDto {
     example: 120,
   })
   totalPages: number;
-
-  @ApiProperty({
-    description: 'The Google Drive folder ID where the book files are stored.',
-    example: '1a2b3c4d5e6f7g8h9i0j_ABCXYZ',
-    nullable: true,
-  })
-  googleFolderId: string | null;
-
-  @ApiProperty({
-    description: 'The link to the archived ZIP file on Google Drive.',
-    example: 'https://drive.google.com/file/d/mock_id/view',
-  })
-  driveLink: string;
 }
 
 export class DownloadFailedItemDto {
   @ApiProperty({
     description: 'The URL of the book that failed to process.',
-    example: 'https://taphuan.nxbgd.vn/tap-huan/doc-sach/shs-tieng-viet-5-tap-hai.4537689926',
+    example:
+      'https://taphuan.nxbgd.vn/tap-huan/doc-sach/shs-tieng-viet-5-tap-hai.4537689926',
   })
   url: string;
 
@@ -60,7 +49,8 @@ export class DownloadFailedItemDto {
 
   @ApiProperty({
     description: 'The error message explaining the failure reason.',
-    example: 'Book with title "shs-tieng-viet-5-tap-hai" already exists in the system (Duplicate).',
+    example:
+      'Book with title "shs-tieng-viet-5-tap-hai" already exists in the system (Duplicate).',
   })
   error: string;
 }
@@ -112,4 +102,3 @@ export class DeleteBookResponseDto {
   })
   message: string;
 }
-

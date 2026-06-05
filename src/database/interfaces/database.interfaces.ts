@@ -21,21 +21,28 @@ export interface IBookPage {
   deleted: number;
 }
 
-export interface IGgFolder {
-  id: number;
-  folder_id: string;
-  folder_name: string;
-  created_at: string;
-  updated_at: string;
-  deleted: number;
+export interface IAppConfig {
+  key: string;
+  value: string;
 }
 
-export interface IGgDrive {
+export type JobStep =
+  | 'RESOLVE_BOOK'
+  | 'SCRAPE_PAGES'
+  | 'INIT_BOOK_RECORD'
+  | 'DOWNLOAD_PAGES'
+  | 'ZIP_DIRECTORY'
+  | 'COMPLETED';
+
+export interface IDownloadJob {
   id: number;
-  book_id: number;
-  gg_folder_id?: number | null;
-  zip_file_url: string;
+  url: string;
+  status: 'pending' | 'processing' | 'completed' | 'failed';
+  total_pages: number;
+  current_page: number;
+  book_id: number | null;
+  error_message?: string | null;
+  current_step: JobStep;
   created_at: string;
   updated_at: string;
-  deleted: number;
 }

@@ -1,4 +1,9 @@
-import { Injectable, OnModuleInit, OnModuleDestroy, Logger } from '@nestjs/common';
+import {
+  Injectable,
+  OnModuleInit,
+  OnModuleDestroy,
+  Logger,
+} from '@nestjs/common';
 import * as sqlite3 from 'sqlite3';
 import * as path from 'path';
 
@@ -40,7 +45,7 @@ export class DatabaseService implements OnModuleInit, OnModuleDestroy {
         deleted BOOLEAN DEFAULT 0
       );
     `);
-    
+
     await this.exec(`
       CREATE TABLE IF NOT EXISTS book_page (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -56,29 +61,62 @@ export class DatabaseService implements OnModuleInit, OnModuleDestroy {
     `);
 
     await this.exec(`
-      CREATE TABLE IF NOT EXISTS gg_folder (
+      CREATE TABLE IF NOT EXISTS download_job (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        folder_id TEXT UNIQUE NOT NULL,
-        folder_name TEXT NOT NULL,
+        url TEXT NOT NULL,
+        status TEXT NOT NULL,
+        total_pages INTEGER DEFAULT 0,
+        current_page INTEGER DEFAULT 0,
+        book_id INTEGER,
+        error_message TEXT,
+        current_step TEXT DEFAULT 'RESOLVE_BOOK',
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
         updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-        deleted BOOLEAN DEFAULT 0
+        FOREIGN KEY(book_id) REFERENCES book(id)
       );
     `);
 
+    try {
+      await this.exec(
+        `ALTER TABLE download_job ADD COLUMN current_step TEXT DEFAULT 'RESOLVE_BOOK';`,
+      );
+      this.logger.log('Added current_step column to download_job table');
+    } catch (err) {
+      this.logger.debug(`Migration note: ${err.message}`);
+    }
+
     await this.exec(`
-      CREATE TABLE IF NOT EXISTS gg_drive (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        book_id INTEGER,
-        gg_folder_id INTEGER,
-        zip_file_url TEXT NOT NULL,
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-        deleted BOOLEAN DEFAULT 0,
-        FOREIGN KEY(book_id) REFERENCES book(id),
-        FOREIGN KEY(gg_folder_id) REFERENCES gg_folder(id)
+      CREATE TABLE IF NOT EXISTS app_config (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
       );
     `);
+  }
+
+  async getConfig(key: string): Promise<string | undefined> {
+    const row = await this.get<{ value: string }>(
+      'SELECT value FROM app_config WHERE key = ?',
+      [key],
+    );
+    return row?.value;
+  }
+
+  async setConfig(key: string, value: string): Promise<void> {
+    await this.run(
+      'INSERT INTO app_config (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value',
+      [key, value],
+    );
+  }
+
+  async getAllConfig(): Promise<Record<string, string>> {
+    const rows = await this.query<{ key: string; value: string }>(
+      'SELECT key, value FROM app_config',
+    );
+    const result: Record<string, string> = {};
+    for (const row of rows) {
+      result[row.key] = row.value;
+    }
+    return result;
   }
 
   exec(sql: string): Promise<void> {
@@ -108,7 +146,10 @@ export class DatabaseService implements OnModuleInit, OnModuleDestroy {
     });
   }
 
-  run(sql: string, params: any[] = []): Promise<{ lastID: number; changes: number }> {
+  run(
+    sql: string,
+    params: any[] = [],
+  ): Promise<{ lastID: number; changes: number }> {
     return new Promise((resolve, reject) => {
       this.db.run(sql, params, function (err) {
         if (err) reject(err);

@@ -7,7 +7,7 @@ async function bootstrap() {
 
   const config = new DocumentBuilder()
     .setTitle('Book Downloader Service')
-    .setDescription('API Service to crawl books and upload to Google Drive')
+    .setDescription('API Service to crawl and download books')
     .setVersion('1.0')
     .addTag('Books')
     .build();

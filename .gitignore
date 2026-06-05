@@ -64,3 +64,4 @@ scripts/bin/harness-cli.exe
 
 # GG credentials.json
 credentials.json
+downloads/
