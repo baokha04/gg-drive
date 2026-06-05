@@ -6,6 +6,9 @@ import axios from 'axios';
 import * as fs from 'fs';
 import * as path from 'path';
 import archiver from 'archiver';
+import { IBook, IBookPage, IGgFolder } from '../database/interfaces/database.interfaces';
+import { BookListItemDto, BookDetailResponseDto } from './dto/book-list-item.dto';
+import { DownloadSuccessItemDto, DownloadFailedItemDto } from './dto/download-response.dto';
 
 @Injectable()
 export class BookDownloaderService {
@@ -18,10 +21,10 @@ export class BookDownloaderService {
 
   async downloadAndStoreBooks(
     targetUrls: string[],
-    googleFolderId?: string,
-  ): Promise<{ success: any[]; failed: any[] }> {
-    const success: any[] = [];
-    const failed: any[] = [];
+  ): Promise<{ success: DownloadSuccessItemDto[]; failed: DownloadFailedItemDto[] }> {
+    const success: DownloadSuccessItemDto[] = [];
+    const failed: DownloadFailedItemDto[] = [];
+    const googleFolderId = process.env.GOOGLE_FOLDER_ID;
 
     // Ensure downloads base directory exists
     const downloadsBaseDir = path.resolve(process.cwd(), 'downloads');
@@ -37,8 +40,8 @@ export class BookDownloaderService {
         this.logger.error(`Error processing URL: ${url}`, error.stack);
         failed.push({
           url,
-          status: 'Thất bại',
-          error: error.message || 'Lỗi không xác định',
+          status: 'Failed',
+          error: error.message || 'Unknown error',
         });
       }
     }
@@ -50,25 +53,25 @@ export class BookDownloaderService {
     url: string,
     downloadsBaseDir: string,
     googleFolderId?: string,
-  ): Promise<any> {
+  ): Promise<DownloadSuccessItemDto> {
     const title = extractTitleFromUrl(url);
     if (!title) {
-      throw new Error('Không thể trích xuất tiêu đề sách từ đường dẫn (URL).');
+      throw new Error('Failed to extract book title from URL.');
     }
 
     // 1. Check duplicate title in database
-    const existingBook = await this.databaseService.get<any>(
+    const existingBook = await this.databaseService.get<IBook>(
       'SELECT id FROM book WHERE title = ? AND deleted = 0',
       [title],
     );
     if (existingBook) {
-      throw new Error(`Sách với title "${title}" đã tồn tại trong hệ thống (Trùng lặp).`);
+      throw new Error(`Book with title "${title}" already exists in the system (Duplicate).`);
     }
 
     // 2. Folder resolution
     let ggFolderInternalId: number | null = null;
     if (googleFolderId) {
-      const existingFolder = await this.databaseService.get<any>(
+      const existingFolder = await this.databaseService.get<IGgFolder>(
         'SELECT id FROM gg_folder WHERE folder_id = ? AND deleted = 0',
         [googleFolderId],
       );
@@ -97,7 +100,7 @@ export class BookDownloaderService {
       });
       htmlContent = response.data;
     } catch (err) {
-      throw new Error(`Không thể truy cập đường dẫn sách: ${err.message}`);
+      throw new Error(`Failed to access the book URL: ${err.message}`);
     }
 
     // Find all links matching https://cdn3.olm.vn*
@@ -108,7 +111,7 @@ export class BookDownloaderService {
     const imageUrls = Array.from(new Set(matches));
 
     if (imageUrls.length === 0) {
-      throw new Error('Không tìm thấy link ảnh sách hợp lệ (https://cdn3.olm.vn*) trong trang web.');
+      throw new Error('No valid book image links (https://cdn3.olm.vn*) found on the page.');
     }
 
     this.logger.log(`Found ${imageUrls.length} image URLs for book: ${title}`);
@@ -117,7 +120,7 @@ export class BookDownloaderService {
     const unsignTitle = removeVietnameseAccents(title);
     const bookRes = await this.databaseService.run(
       'INSERT INTO book (title, description, unsign_title, url, total_pages) VALUES (?, ?, ?, ?, ?)',
-      [title, `Sách tải từ ${url}`, unsignTitle, url, imageUrls.length],
+      [title, `Book downloaded from ${url}`, unsignTitle, url, imageUrls.length],
     );
     const bookId = bookRes.lastID;
 
@@ -126,7 +129,7 @@ export class BookDownloaderService {
     const bookDirPath = path.join(downloadsBaseDir, bookDirName);
     fs.mkdirSync(bookDirPath, { recursive: true });
 
-    const downloadedPages: any[] = [];
+    const downloadedPages: { pageNumber: number; destPath: string }[] = [];
     const zipPath = path.join(downloadsBaseDir, `${bookDirName}.zip`);
 
     try {
@@ -181,7 +184,7 @@ export class BookDownloaderService {
       // Return details
       return {
         url,
-        status: 'Thành công',
+        status: 'Success',
         bookId,
         bookTitle: title,
         totalPages: imageUrls.length,
@@ -260,5 +263,76 @@ export class BookDownloaderService {
       archive.directory(sourceDir, false);
       archive.finalize();
     });
+  }
+
+  async findAllBooks(): Promise<BookListItemDto[]> {
+    return this.databaseService.query<BookListItemDto>(`
+      SELECT b.id, b.title, b.description, b.unsign_title, b.url, b.total_pages, b.created_at, b.updated_at,
+             d.zip_file_url, f.folder_id as google_folder_id, f.folder_name as google_folder_name
+      FROM book b
+      LEFT JOIN gg_drive d ON b.id = d.book_id AND d.deleted = 0
+      LEFT JOIN gg_folder f ON d.gg_folder_id = f.id AND f.deleted = 0
+      WHERE b.deleted = 0
+      ORDER BY b.created_at DESC
+    `);
+  }
+
+  async findBookById(id: number): Promise<BookDetailResponseDto | null> {
+    const book = await this.databaseService.get<BookListItemDto>(`
+      SELECT b.id, b.title, b.description, b.unsign_title, b.url, b.total_pages, b.created_at, b.updated_at,
+             d.zip_file_url, f.folder_id as google_folder_id, f.folder_name as google_folder_name
+      FROM book b
+      LEFT JOIN gg_drive d ON b.id = d.book_id AND d.deleted = 0
+      LEFT JOIN gg_folder f ON d.gg_folder_id = f.id AND f.deleted = 0
+      WHERE b.id = ? AND b.deleted = 0
+    `, [id]);
+
+    if (!book) {
+      return null;
+    }
+
+    const pages = await this.databaseService.query<IBookPage>(`
+      SELECT id, page_number, image_url, download_url, created_at, updated_at
+      FROM book_page
+      WHERE book_id = ? AND deleted = 0
+      ORDER BY page_number ASC
+    `, [id]);
+
+    return {
+      ...book,
+      pages: pages.map(p => ({
+        id: p.id,
+        page_number: p.page_number,
+        image_url: p.image_url,
+        download_url: p.download_url || '',
+        created_at: p.created_at,
+        updated_at: p.updated_at,
+      })),
+    };
+  }
+
+  async softDeleteBook(id: number): Promise<boolean> {
+    const book = await this.databaseService.get<IBook>(
+      'SELECT id FROM book WHERE id = ? AND deleted = 0',
+      [id],
+    );
+    if (!book) {
+      return false;
+    }
+
+    await this.databaseService.run(
+      'UPDATE book SET deleted = 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
+      [id],
+    );
+    await this.databaseService.run(
+      'UPDATE book_page SET deleted = 1, updated_at = CURRENT_TIMESTAMP WHERE book_id = ?',
+      [id],
+    );
+    await this.databaseService.run(
+      'UPDATE gg_drive SET deleted = 1, updated_at = CURRENT_TIMESTAMP WHERE book_id = ?',
+      [id],
+    );
+
+    return true;
   }
 }

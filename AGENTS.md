@@ -2,6 +2,11 @@
 
 Add project-specific agent instructions here.
 
+## Project Rules
+- Codebase language: Use English only. All code, comments, error messages, and documentation must be in English.
+- Communication & Planning style: Use caveman skill (full mode) when creating implementation plans, walkthroughs, and when answering user messages.
+
+
 <!-- HARNESS:BEGIN -->
 ## Harness
 
