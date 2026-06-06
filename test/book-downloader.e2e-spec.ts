@@ -6,6 +6,8 @@ import { DatabaseService } from '../src/database/database.service';
 import axios from 'axios';
 import * as sqlite3 from 'sqlite3';
 import { Readable } from 'stream';
+import * as fs from 'fs';
+import * as path from 'path';
 
 // Mock axios
 jest.mock('axios', () => {
@@ -37,6 +39,32 @@ class TestDatabaseService extends DatabaseService {
 describe('BookDownloaderController (e2e)', () => {
   let app: INestApplication;
   let dbService: DatabaseService;
+
+  function cleanupTestDirectories() {
+    const downloadsDir = path.resolve(process.cwd(), 'downloads');
+    const items = [
+      'book_1',
+      'book_1.zip',
+      'book_5',
+      'book_5.zip',
+      'book_8',
+      'book_8.zip',
+    ];
+    for (const item of items) {
+      const fullPath = path.join(downloadsDir, item);
+      if (fs.existsSync(fullPath)) {
+        fs.rmSync(fullPath, { recursive: true, force: true });
+      }
+    }
+  }
+
+  beforeAll(() => {
+    cleanupTestDirectories();
+  });
+
+  afterAll(() => {
+    cleanupTestDirectories();
+  });
 
   beforeEach(async () => {
     jest.clearAllMocks();
@@ -282,6 +310,108 @@ describe('BookDownloaderController (e2e)', () => {
         .get('/api/books')
         .expect(200);
       expect(listResponse.body.find((b: any) => b.id === 8)).toBeUndefined();
+    });
+  });
+
+  describe('Catalog Scraper Module (e2e)', () => {
+    it('should return 400 if catalogUrl is missing for scrape', async () => {
+      await request(app.getHttpServer())
+        .post('/api/catalog/scrape')
+        .send({})
+        .expect(400);
+    });
+
+    it('should scrape catalog and persist to DB, then download pending books', async () => {
+      const mockCatalogHtml = `
+        <html>
+          <body>
+            [Chân trời sáng tạo](https://taphuan.nxbgd.vn/tap-huan/cac-bo-sach-khac?grade=6&id_book=3)
+            <a href="/tap-huan/chi-tiet-sach/shs-toan-5-tap-mot-111">Math 5 Detail</a>
+          </body>
+        </html>
+      `;
+      const mockDetailHtml = `
+        <html>
+          <body>
+            [Math 5](https://taphuan.nxbgd.vn/tap-huan/doc-sach/shs-toan-5-tap-mot.111)
+          </body>
+        </html>
+      `;
+      const mockBookHtml = `
+        <html>
+          <body>
+            <img src="https://cdn3.olm.vn/book/page1.jpg" />
+          </body>
+        </html>
+      `;
+
+      (axios.get as jest.Mock)
+        .mockResolvedValueOnce({ data: mockCatalogHtml })
+        .mockResolvedValueOnce({ data: mockDetailHtml });
+
+      const scrapeRes = await request(app.getHttpServer())
+        .post('/api/catalog/scrape')
+        .send({
+          catalogUrl:
+            'https://taphuan.nxbgd.vn/tap-huan/cac-bo-sach-khac/page-1?grade=6&id_book=3',
+        })
+        .expect(200);
+
+      expect(scrapeRes.body.success).toBe(true);
+      expect(scrapeRes.body.persistedPendingBooks).toBe(1);
+
+      const grade = await dbService.get(
+        'SELECT * FROM catalog_grade WHERE grade = 6',
+      );
+      expect(grade).toBeDefined();
+      expect((grade as any).name).toBe('Lớp 6');
+
+      const publisher = await dbService.get(
+        'SELECT * FROM catalog_publisher WHERE publisher_id = 3',
+      );
+      expect(publisher).toBeDefined();
+      expect((publisher as any).name).toBe('Chân trời sáng tạo');
+
+      const detail = await dbService.get(
+        'SELECT * FROM catalog_detail WHERE catalog_grade_id = ?',
+        [(grade as any).id],
+      );
+      expect(detail).toBeDefined();
+      expect((detail as any).title).toBe('Math 5');
+      expect((detail as any).status).toBe('pending');
+
+      (axios.get as jest.Mock).mockResolvedValueOnce({ data: mockBookHtml });
+
+      const downloadRes = await request(app.getHttpServer())
+        .post('/api/books/download/catalog-pending')
+        .expect(200);
+
+      expect(downloadRes.body.success).toBe(true);
+      expect(downloadRes.body.message).toContain(
+        '1 pending books queued for download.',
+      );
+      expect(downloadRes.body.jobs.length).toBe(1);
+
+      const jobId = downloadRes.body.jobs[0].id;
+      expect(jobId).toBeDefined();
+
+      const detailProcessing = await dbService.get(
+        'SELECT status FROM catalog_detail WHERE id = ?',
+        [(detail as any).id],
+      );
+      expect((detailProcessing as any).status).toBe('processing');
+
+      const finalJobStatus = await waitForJobToFinish(
+        app.getHttpServer(),
+        jobId,
+      );
+      expect(finalJobStatus.status).toBe('completed');
+
+      const detailCompleted = await dbService.get(
+        'SELECT status FROM catalog_detail WHERE id = ?',
+        [(detail as any).id],
+      );
+      expect((detailCompleted as any).status).toBe('completed');
     });
   });
 });

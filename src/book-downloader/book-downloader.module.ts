@@ -15,6 +15,6 @@ import { BookResolverService } from './services/book-resolver.service';
     ArchiveService,
     BookResolverService,
   ],
-  exports: [BookDownloaderService],
+  exports: [BookDownloaderService, BookScraperService],
 })
 export class BookDownloaderModule {}

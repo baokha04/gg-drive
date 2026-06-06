@@ -86,6 +86,41 @@ export class DatabaseService implements OnModuleInit, OnModuleDestroy {
     }
 
     await this.exec(`
+      CREATE TABLE IF NOT EXISTS catalog_grade (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        grade INTEGER UNIQUE NOT NULL,
+        name TEXT,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+
+    await this.exec(`
+      CREATE TABLE IF NOT EXISTS catalog_publisher (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        publisher_id INTEGER UNIQUE NOT NULL,
+        name TEXT NOT NULL,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+
+    await this.exec(`
+      CREATE TABLE IF NOT EXISTS catalog_detail (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        catalog_grade_id INTEGER,
+        catalog_publisher_id INTEGER,
+        title TEXT NOT NULL,
+        url TEXT UNIQUE NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending',
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY(catalog_grade_id) REFERENCES catalog_grade(id),
+        FOREIGN KEY(catalog_publisher_id) REFERENCES catalog_publisher(id)
+      );
+    `);
+
+    await this.exec(`
       CREATE TABLE IF NOT EXISTS app_config (
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL

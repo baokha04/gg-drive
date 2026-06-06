@@ -95,6 +95,27 @@ export class BookDownloaderService {
     return queuedJobs;
   }
 
+  async downloadPendingFromCatalog(): Promise<QueuedJobItemDto[]> {
+    const pendingRows = await this.databaseService.query<{ url: string }>(
+      "SELECT url FROM catalog_detail WHERE status = 'pending'",
+    );
+
+    if (pendingRows.length === 0) {
+      return [];
+    }
+
+    const urls = pendingRows.map((r) => r.url);
+
+    for (const url of urls) {
+      await this.databaseService.run(
+        "UPDATE catalog_detail SET status = 'processing', updated_at = CURRENT_TIMESTAMP WHERE url = ?",
+        [url],
+      );
+    }
+
+    return this.downloadAndStoreBooks(urls);
+  }
+
   getStepsList(): StepsListDto {
     return { steps: [...this.STEP_PIPELINE] };
   }
@@ -316,6 +337,10 @@ export class BookDownloaderService {
         'UPDATE download_job SET status = ?, book_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
         ['completed', bookId, job.id],
       );
+      await this.databaseService.run(
+        "UPDATE catalog_detail SET status = 'completed', updated_at = CURRENT_TIMESTAMP WHERE url = ?",
+        [job.url],
+      );
       this.logger.log(
         `Job ${job.id} completed successfully. Linked book ID: ${bookId}`,
       );
@@ -328,6 +353,10 @@ export class BookDownloaderService {
       await this.databaseService.run(
         'UPDATE download_job SET status = ?, error_message = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
         ['failed', error.message || 'Unknown error', job.id],
+      );
+      await this.databaseService.run(
+        "UPDATE catalog_detail SET status = 'failed', updated_at = CURRENT_TIMESTAMP WHERE url = ?",
+        [job.url],
       );
     }
   }

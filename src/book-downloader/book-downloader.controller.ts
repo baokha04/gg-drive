@@ -79,6 +79,34 @@ export class BookDownloaderController {
     };
   }
 
+  @Post('download/catalog-pending')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({
+    summary: 'Queue all pending book URLs from catalog_detail database table',
+  })
+  @ApiResponse({
+    status: 200,
+    description: 'List of queued download jobs.',
+    type: QueueResponseDto,
+  })
+  async downloadCatalogPending(): Promise<QueueResponseDto> {
+    const jobs = await this.bookDownloaderService.downloadPendingFromCatalog();
+
+    if (jobs.length === 0) {
+      return {
+        success: true,
+        message: 'No pending books found in catalog_detail.',
+        jobs: [],
+      };
+    }
+
+    return {
+      success: true,
+      message: `${jobs.length} pending books queued for download.`,
+      jobs,
+    };
+  }
+
   @Post('download/retry/:id')
   @HttpCode(HttpStatus.OK)
   @ApiOperation({ summary: 'Retry a failed download job' })
